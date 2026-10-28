@@ -17,7 +17,11 @@ PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JAR="${1:-$PROJECT/dist/services.jar}"
 VERSION="${2:-$(sed -n 's/^version=//p' "$PROJECT/module/module.prop")}"
 [ -n "$VERSION" ] || VERSION="0.0.0"
-TAG_VERSION="$VERSION"
+# a PR ref (2/merge) or a branch name (test) is not a version: keep only safe
+# characters so the sed and the zip name always work
+VERSION="$(printf '%s' "$VERSION" | tr -c 'A-Za-z0-9._-' '-')"
+VERSION="${VERSION#-}"; VERSION="${VERSION%-}"
+[ -n "$VERSION" ] || VERSION="0.0.0"
 case "$VERSION" in
   v*) ;;
   *) VERSION="v$VERSION" ;;
@@ -35,8 +39,8 @@ cp -a "$PROJECT/module/." "$WORK/"
 
 # version fields of the module
 sed -i \
-  -e "s/^version=.*/version=$VERSION/" \
-  -e "s/^versionCode=.*/versionCode=$VERSION_CODE/" \
+  -e "s|^version=.*|version=$VERSION|" \
+  -e "s|^versionCode=.*|versionCode=$VERSION_CODE|" \
   "$WORK/module.prop"
 
 mkdir -p "$WORK/system/framework"
