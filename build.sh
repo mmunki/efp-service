@@ -1,31 +1,56 @@
 #!/usr/bin/env bash
 # ============================================================================
-# build.sh -- compile the FactoryPop protection service and package it as a
-#            services.jar (dist/services.jar)
+# build.sh -- compile the FactoryPop protection service and package it
+# ----------------------------------------------------------------------------
+# The fp-test-guard.sh daemon now lives in real Android sources:
+# FpUninstallGuard + FpGuardLoop + FpUninstallGuardService +
+# com.factorypop.efp.tool.{BlockUninstall,GuardDaemon}.
 #
-# The fp-service logic now lives in real Android sources instead of the shell
-# script only: FpUninstallGuard + FpUninstallGuardService are packaged into
-# dist/services.jar, which is what gets merged into the system as the services
-# jar.  The protection then runs without any command in /system/bin.
+# Two outputs are possible:
+#
+#   * standalone guard jar (default without --base):
+#       dist/services.jar  -- a small jar with only the guard dex
+#
+#   * merged services.jar (default when a base jar is given):
+#       the given framework services.jar plus the guard dex appended as the
+#       next free classesN.dex, every original entry untouched.  That is the
+#       file to install as /system/framework/services.jar.
 #
 # Usage:
-#   ./build.sh
+#   ./build.sh                                  # standalone guard jar
+#   ./build.sh --base vendor/services.jar       # merged services.jar
+#   ./build.sh --base services.jar --out dist/services.jar
 #
 # Environment:
-#   ANDROID_SDK_ROOT   checkout of mmunki/android-sdk-mini (default
-#                      $HOME/src/android-sdk-mini), or an assembled toolkit
-#   SDK_API            android API level (default 36)
-#   SDK_BUILD_TOOLS    build-tools version (default 36.0.0)
+#   ANDROID_SDK_ROOT      Android SDK (default: common locations)
+#   SDK_API               android API level (default 36)
+#   SDK_BUILD_TOOLS       build-tools version (default 36.0.0)
+#   FACTORYPOP_BASE_JAR   same as --base
 # ============================================================================
 set -euo pipefail
 
 SDK_API="${SDK_API:-36}"
 SDK_BUILD_TOOLS="${SDK_BUILD_TOOLS:-36.0.0}"
 
+OUT=""
+BASE="${FACTORYPOP_BASE_JAR:-}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base)   BASE="${2:?--base needs a value}"; shift 2 ;;
+    --out)    OUT="${2:?--out needs a value}"; shift 2 ;;
+    --standalone) BASE=""; shift ;;
+    -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)       echo "error: unknown option: $1" >&2; exit 1 ;;
+    *)        OUT="$1"; shift ;;
+  esac
+done
+[ -n "$OUT" ] || OUT="dist/services.jar"
+
 # Locate a usable SDK root.  Try the explicit env var first, then a few common
 # locations so the build works both in the developer container and in CI.
 SDK=""
-for cand in "${ANDROID_SDK_ROOT:-}" "$HOME/src/android-sdk-mini" "/tmp/opencode/android-sdk-mini/build/stage/sdk" "/tmp/opencode/android-sdk-mini/sdk" "/usr/local/lib/android/sdk"; do
+for cand in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" "$HOME/src/android-sdk-mini" "/tmp/opencode/android-sdk-mini/build/stage/sdk" "/tmp/opencode/android-sdk-mini/sdk" "/usr/local/lib/android/sdk"; do
   [ -n "$cand" ] || continue
   for root in "$cand" "$cand/sdk" "$cand/build/stage/sdk"; do
     [ -d "$root" ] || continue
@@ -35,12 +60,34 @@ for cand in "${ANDROID_SDK_ROOT:-}" "$HOME/src/android-sdk-mini" "/tmp/opencode/
     fi
   done
 done
+if [ -z "$SDK" ]; then
+  # the requested versions are not installed, take a root that has both trees
+  for cand in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" "$HOME/src/android-sdk-mini" "/tmp/opencode/android-sdk-mini/build/stage/sdk" "/tmp/opencode/android-sdk-mini/sdk" "/usr/local/lib/android/sdk"; do
+    [ -n "$cand" ] || continue
+    for root in "$cand" "$cand/sdk" "$cand/build/stage/sdk"; do
+      if [ -d "$root/platforms" ] && [ -d "$root/build-tools" ]; then
+        SDK="$root"
+        break 2
+      fi
+    done
+  done
+fi
 [ -n "$SDK" ] || { echo "error: no Android SDK found for API $SDK_API" >&2; exit 1; }
+
+# fall back to the newest installed platform / build-tools
+if [ ! -f "$SDK/platforms/android-$SDK_API/android.jar" ]; then
+  SDK_API="$(ls "$SDK/platforms" 2>/dev/null | sed -n 's/^android-\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1)"
+  [ -n "$SDK_API" ] || { echo "error: no platform android.jar in $SDK/platforms" >&2; exit 1; }
+fi
+if [ ! -d "$SDK/build-tools/$SDK_BUILD_TOOLS" ]; then
+  SDK_BUILD_TOOLS="$(ls "$SDK/build-tools" 2>/dev/null | sort -V | tail -1)"
+  [ -n "$SDK_BUILD_TOOLS" ] || { echo "error: no build-tools in $SDK/build-tools" >&2; exit 1; }
+fi
+echo "==> SDK $SDK (API $SDK_API, build-tools $SDK_BUILD_TOOLS)"
 
 SDK_PLATFORM_DIR="$SDK/platforms/android-$SDK_API"
 SDK_ANDROID_JAR="$SDK_PLATFORM_DIR/android.jar"
 SDK_BUILD_TOOLS_DIR="$SDK/build-tools/$SDK_BUILD_TOOLS"
-SDK_JAR_DIR="$SDK_BUILD_TOOLS_DIR/lib"
 if [ -x "$SDK/bin/aapt2" ]; then
   AAPT2="$SDK/bin/aapt2"
 elif [ -x "$SDK_BUILD_TOOLS_DIR/aapt2" ]; then
@@ -59,14 +106,25 @@ JAVA="${JAVA:-java}"
 
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$PROJECT/.build-services"
-OUT="${1:-dist/services.jar}"
 rm -rf "$WORK"
 mkdir -p "$WORK/compiled" "$WORK/gen" "$WORK/classes" "$WORK/dex"
 
-echo "==> aapt2 compile resources"
-( cd "$WORK/compiled" && zip -q resources.zip -n . 2>/dev/null || true )
+if [ -n "$BASE" ]; then
+  # the final artefact is the merged framework jar
+  DEX_JAR="$WORK/services-guard.jar"
+else
+  DEX_JAR="$OUT"
+fi
+OUT_DIR="$(dirname "$DEX_JAR")"
+mkdir -p "$OUT_DIR"
+DEX_JAR="$(cd "$OUT_DIR" && pwd)/$(basename "$DEX_JAR")"
+
 RES=""
-[ -f "$WORK/compiled/resources.zip" ] && RES="$WORK/compiled/resources.zip"
+if [ -d "$PROJECT/src/res" ] && [ -n "$(find "$PROJECT/src/res" -type f -print -quit)" ]; then
+  echo "==> aapt2 compile resources"
+  "$AAPT2" compile --dir "$PROJECT/src/res" -o "$WORK/compiled/resources.zip"
+  RES="$WORK/compiled/resources.zip"
+fi
 
 echo "==> aapt2 link"
 "$AAPT2" link \
@@ -93,12 +151,20 @@ if [ ${#CLASS_FILES[@]} -eq 0 ]; then
 fi
 "$D8" --min-api 24 --lib "$SDK_ANDROID_JAR" --output "$WORK/dex" "${CLASS_FILES[@]}"
 
-mkdir -p "$(dirname "$OUT")"
-OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
-rm -f "$OUT"
-( cd "$WORK/dex" && jar cf "$OUT" classes.dex )
-chmod 644 "$OUT"
+rm -f "$DEX_JAR"
+( cd "$WORK/dex" && jar cf "$DEX_JAR" classes.dex )
+chmod 644 "$DEX_JAR"
 
-echo "==> built $OUT"
-echo "bytes: $(wc -c <"$OUT")"
-echo "sha256: $(sha256sum "$OUT" | cut -d' ' -f1)"
+if [ -n "$BASE" ]; then
+  echo "==> merging the guard into the given services.jar"
+  bash "$PROJECT/merge-services.sh" --base "$BASE" --guard "$DEX_JAR" --out "$OUT"
+  exit $?
+fi
+
+echo "==> built $DEX_JAR"
+echo "bytes: $(wc -c <"$DEX_JAR")"
+echo "sha256: $(sha256sum "$DEX_JAR" | cut -d' ' -f1)"
+echo
+echo "This is the boot-safe guard jar.  Package it with:"
+echo "  ./make-module.sh dist/services-guard.jar <version>"
+echo "Do not mount it over /system/framework/services.jar."

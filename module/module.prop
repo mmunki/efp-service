@@ -1,0 +1,6 @@
+id=factorypop-efp
+name=FactoryPop eFootball protection
+version=v0.5.0
+versionCode=50
+author=FactoryPop
+description=Self-contained guard jar in the module directory. Protects jp.konami.pesam, backs it up, and writes /data/adb/jp.konami.pes/uninstall.log with the log and process that deleted the data. Does NOT replace /system/framework/services.jar.

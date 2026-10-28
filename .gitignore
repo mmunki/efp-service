@@ -1,2 +1,5 @@
 dist/
 .build-services/
+.build-merge/
+.build-module/
+.build-tests/

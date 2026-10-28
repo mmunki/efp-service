@@ -1,8 +1,6 @@
 package com.factorypop.efp;
 
 import android.content.Context;
-import android.content.pm.ApplicationInfo;
-import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.app.ActivityManager;
 import android.os.StatFs;
@@ -37,10 +35,14 @@ public class FpUninstallGuard {
     public final File stateDir;
     public final File modDir;
     public final File jarFile;
+    public final File forensicDir;
+    public final File dataRoot;
     public final long snapMax;
     public final long minMb;
 
+    private FpForensics forensics;
     private boolean waitLogged = false;
+    private boolean partialRestore = true;
 
     public FpUninstallGuard(Context ctx, String pkg) {
         this.ctx = ctx;
@@ -78,21 +80,73 @@ public class FpUninstallGuard {
         String mmEnv = System.getenv("FACTORYPOP_MIN_MB");
         if (mmEnv != null) { try { mm = Long.parseLong(mmEnv.trim()); } catch (NumberFormatException ignored) {} }
         this.minMb = mm;
+
+        String fd = System.getenv("FACTORYPOP_FORENSIC_DIR");
+        if (fd == null || fd.trim().isEmpty()) { fd = Forensic.DEFAULT_DIR; }
+        this.forensicDir = new File(fd.trim());
+
+        String pr = System.getenv("FACTORYPOP_PARTIAL_RESTORE");
+        if (pr != null) { this.partialRestore = !"0".equals(pr.trim()); }
+
+        String dr = System.getenv("FACTORYPOP_DATA_DIR");
+        this.dataRoot = new File((dr == null || dr.trim().isEmpty()) ? "/data/data" : dr.trim());
+    }
+
+    /** forensic log under /data/adb/jp.konami.pes/uninstall.log */
+    public FpForensics forensics() {
+        if (forensics == null) { forensics = new FpForensics(this); }
+        return forensics;
+    }
+
+    public File uninstallLogFile() { return new File(forensicDir, Forensic.LOG_NAME); }
+
+    public File manifestFile() { return new File(snapshotDir(), Forensic.MANIFEST_NAME); }
+
+    public boolean partialRestoreEnabled() { return partialRestore; }
+
+    /** Loads the manifest written together with the last snapshot, if any. */
+    public Forensic.Manifest readManifest() {
+        File f = manifestFile();
+        if (!f.isFile()) { return null; }
+        try {
+            StringBuilder sb = new StringBuilder();
+            BufferedReader br = new BufferedReader(new FileReader(f));
+            String line;
+            while ((line = br.readLine()) != null) { sb.append(line).append('\n'); }
+            br.close();
+            return Forensic.Manifest.parse(sb.toString());
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    public void writeManifest(Forensic.Manifest m) {
+        if (m == null) { return; }
+        try {
+            Forensic.writeText(manifestFile(), m.toTsv());
+            forensics().manifestSaved(manifestFile(), m.files, m.totalBytes);
+        } catch (IOException e) {
+            forensics().warn("BACKUP", "manifest write failed: " + e);
+        }
     }
 
     public static Context currentContext() { return appContext; }
     public static void attachContext(Context c) { appContext = c; }
 
-    /** try to obtain a usable (system) context when none was attached */
+    /**
+     * A usable context when none was attached.
+     *
+     * In an app_process the guard has no Android application context at all;
+     * that is fine, {@link Platform} talks to the system services directly.
+     * Only an already existing ActivityThread is reused, the guard never
+     * attaches itself to the system as a fake system process.
+     */
     public static Context acquireContext() {
         if (appContext != null) { return appContext; }
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
             Object thread = null;
-            try { thread = at.getMethod("systemMain").invoke(null); } catch (Exception ignored) {}
-            if (thread == null) {
-                try { thread = at.getMethod("currentActivityThread").invoke(null); } catch (Exception ignored) {}
-            }
+            try { thread = at.getMethod("currentActivityThread").invoke(null); } catch (Exception ignored) {}
             if (thread != null) {
                 for (String m : new String[] { "getSystemContext", "getApplication" }) {
                     try {
@@ -129,13 +183,12 @@ public class FpUninstallGuard {
     }
 
     public boolean isInstalled() {
-        PackageManager p = pm();
-        if (p == null) { return false; }
-        try { p.getPackageInfo(pkg, 0); return true; } catch (Exception e) { return false; }
+        // IPackageManager first, the same service pm queries - no /system/bin/pm
+        return Platform.packageInstalled(pkg, 0);
     }
 
     /** /data/data/<pkg> */
-    public File dataDir() { return new File("/data/data", pkg); }
+    public File dataDir() { return new File(dataRoot, pkg); }
 
     public File snapshotDir() { return new File(stateDir, "snapshot"); }
     public File snapshotFile() { return new File(snapshotDir(), "data.tar"); }
@@ -173,6 +226,7 @@ public class FpUninstallGuard {
             fw.write(timestamp() + " " + msg + "\n");
             fw.close();
         } catch (IOException ignored) {}
+        try { forensics().mirror(msg); } catch (Throwable ignored) {}
         System.out.println(msg);
     }
 
@@ -186,10 +240,13 @@ public class FpUninstallGuard {
         snapshotDir().mkdirs();
         File snap = snapshotFile();
         File snapTs = snapshotTsFile();
+        long started = System.currentTimeMillis();
+        String trigger = force ? "forced" : "auto";
 
         // never overwrite a good snapshot with a wiped/empty data dir
         if (snap.isFile() && snap.length() > 0 && !sentinelFile().exists()) {
             log("snapshot: skipped (data looks wiped - restore pending)");
+            forensics().backupSkipped("data looks wiped - restore pending");
             return true;
         }
         if (!force && snap.isFile() && snap.length() > 0 && snapTs.isFile()) {
@@ -200,12 +257,14 @@ public class FpUninstallGuard {
         // app running check
         if (appRunning()) {
             if (force) { log("snapshot: skipped (app is running)"); }
+            if (force) { forensics().backupSkipped("app is running"); }
             return true;
         }
         // low space
         long freeKb = freeSpaceKb("/data");
         if (freeKb > 0 && freeKb < 5242880L) {
             log("snapshot: skipped (low space)");
+            forensics().backupSkipped("low space: " + freeKb + "KB free, need 5120MB");
             return false;
         }
         // min size wait
@@ -220,6 +279,7 @@ public class FpUninstallGuard {
         waitLogged = false;
 
         log("snapshot: creating (game is idle)...");
+        forensics().backupStart(trigger, d, freeKb);
         File tmp = new File(snapshotDir(), "data.tar.tmp");
         tmp.delete();
         int rc = exec("tar", "-cf", tmp.getAbsolutePath(), "-C", "/data/data", pkg);
@@ -233,10 +293,16 @@ public class FpUninstallGuard {
             try { writeFile(snapTs, String.valueOf(now())); } catch (Exception ignored) {}
             touchSentinel();
             log("snapshot: ready (" + (snap.length() / (1024 * 1024)) + "MB)");
+            String sha = Forensic.sha256(snap);
+            forensics().backupDone(snap, snap.length(),
+                    System.currentTimeMillis() - started, sha);
+            writeManifest(Forensic.Manifest.scan(d));
             return true;
         } else {
             tmp.delete();
             log("snapshot: FAILED");
+            forensics().backupFailed("tar rc=" + rc
+                    + " tmp=" + (tmp.isFile() ? tmp.length() : 0) + "bytes");
             return false;
         }
     }
@@ -252,14 +318,19 @@ public class FpUninstallGuard {
         restoreData();
     }
 
-    public boolean restoreData() {
+    public boolean restoreData() { return restoreData("requested"); }
+
+    public boolean restoreData(String reason) {
         File snap = snapshotFile();
         needRestoreFile().delete();
         if (!snap.isFile() || snap.length() == 0) {
             log("restore: no snapshot available");
+            forensics().restoreStart(reason + " (no snapshot)", snap);
             return false;
         }
+        long started = System.currentTimeMillis();
         log("restore: begin (" + (snap.length() / (1024 * 1024)) + "MB)");
+        forensics().restoreStart(reason, snap);
         forceStopApp(pkg);
         sleep(1000);
         deleteRecursive(dataDir());
@@ -273,6 +344,8 @@ public class FpUninstallGuard {
         }
         touchSentinel();
         log("restore: done - data returned from snapshot");
+        forensics().restoreDone(rc == 0, System.currentTimeMillis() - started);
+        writeManifest(Forensic.Manifest.scan(dataDir()));
         return rc == 0;
     }
 
@@ -297,6 +370,10 @@ public class FpUninstallGuard {
      * package.
      */
     public boolean setUninstallBlocked(boolean block) {
+        // PackageManagerService.setBlockUninstallForUser over IPackageManager:
+        // the call that used to need `cmd package` in /system/bin.
+        if (Platform.setBlockUninstall(pkg, block, 0)) { return true; }
+
         PackageManager p = pm();
         if (p == null) { return false; }
         try {
@@ -337,6 +414,12 @@ public class FpUninstallGuard {
             olds.delete();
             snap.renameTo(olds);
             snapshotTsFile().delete();
+            File mf = manifestFile();
+            if (mf.isFile()) {
+                File oldMf = new File(snapshotDir(), "manifest.old.tsv");
+                oldMf.delete();
+                mf.renameTo(oldMf);
+            }
             log("snapshot: previous install archived as data.old.tar");
         }
         // remove sentinel
@@ -351,30 +434,12 @@ public class FpUninstallGuard {
     }
 
     public String installStamp() {
-        PackageManager p = pm();
-        if (p == null) { return null; }
-        try {
-            PackageInfo pi = p.getPackageInfo(pkg, 0);
-            return String.valueOf(pi.firstInstallTime);
-        } catch (Exception e) {
-            return null;
-        }
+        long t = Platform.firstInstallTime(pkg, 0);
+        return t > 0 ? String.valueOf(t) : null;
     }
 
     public int appUid() {
-        PackageManager p = pm();
-        if (p == null) { return -1; }
-        try {
-            ApplicationInfo ai = p.getApplicationInfo(pkg, 0);
-            return ai.uid;
-        } catch (Exception e) {
-            // fallback stat
-            try {
-                File d = dataDir();
-                // no stat uid easily; return -1
-            } catch (Exception ignored) {}
-            return -1;
-        }
+        return Platform.appUid(pkg, 0);
     }
 
     public boolean appRunning() {
@@ -400,15 +465,8 @@ public class FpUninstallGuard {
                 }
             } catch (Exception ignored) {}
         }
-        // fallback pidof
-        try {
-            Process p = new ProcessBuilder("pidof", pkg).start();
-            BufferedReader br = new BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
-            String line = br.readLine();
-            p.waitFor();
-            return line != null && !line.trim().isEmpty();
-        } catch (Exception ignored) {}
-        return false;
+        // /proc scan, no pidof binary needed
+        return Platform.pidOf(pkg) > 0;
     }
 
     public boolean sentinelMissing() { return !sentinelFile().exists(); }
@@ -430,6 +488,10 @@ public class FpUninstallGuard {
 
     // ---- helpers ----
     private void forceStopApp(String p) {
+        // IActivityManager.forceStopPackage is what `am force-stop` calls - and
+        // `am` is only a shell wrapper around /system/bin/cmd.  Talk to the
+        // service directly so the wipe restore needs no command in bin/.
+        if (Platform.forceStop(p, 0)) { return; }
         Context c = ctx;
         if (c == null) { c = acquireContext(); }
         if (c != null) {
@@ -438,7 +500,6 @@ public class FpUninstallGuard {
                 if (am != null) { am.killBackgroundProcesses(p); }
             } catch (Exception ignored) {}
         }
-        exec("am", "force-stop", p);
     }
 
     public static int exec(String... cmd) {
@@ -455,17 +516,17 @@ public class FpUninstallGuard {
     }
 
     public static boolean commandExists(String name) {
-        try {
-            Process p = new ProcessBuilder("sh", "-c", "command -v " + name).start();
-            java.io.InputStream is = p.getInputStream();
-            byte[] buf = new byte[256];
-            int n = is.read(buf);
-            is.close();
-            p.waitFor();
-            return n > 0;
-        } catch (Exception e) {
-            return false;
+        // look at the standard bin directories instead of running a shell
+        String[] dirs = {
+                "/system/bin", "/system/xbin", "/system_ext/bin", "/vendor/bin",
+                "/product/bin", "/odm/bin", "/apex/com.android.runtime/bin",
+                "/apex/com.android.toybox/bin", "/data/adb/ksu/bin", "/data/adb/magisk"
+        };
+        for (String d : dirs) {
+            File f = new File(d, name);
+            if (f.isFile()) { return true; }
         }
+        return false;
     }
 
     private static String timestamp() {
@@ -536,17 +597,26 @@ public class FpUninstallGuard {
     }
 
     private long dirSizeMb(File d) {
-        try {
-            Process p = new ProcessBuilder("du", "-sm", d.getAbsolutePath()).start();
-            BufferedReader br = new BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
-            String line = br.readLine();
-            p.waitFor();
-            br.close();
-            if (line != null) {
-                String[] parts = line.trim().split("\\s+");
-                if (parts.length > 0) { return Long.parseLong(parts[0]); }
+        // walk the tree in Java; `du` is not needed (and nothing in bin/ is)
+        if (d == null || !d.isDirectory()) { return -1; }
+        long total = 0;
+        java.util.ArrayDeque<File> stack = new java.util.ArrayDeque<File>();
+        stack.push(d);
+        int guard = 0;
+        while (!stack.isEmpty() && guard++ < 200000) {
+            File f = stack.pop();
+            File[] kids = f.listFiles();
+            if (kids == null) { continue; }
+            for (File k : kids) {
+                try {
+                    if (k.isDirectory()) {
+                        stack.push(k);
+                    } else {
+                        total += k.length();
+                    }
+                } catch (Throwable ignored) {}
             }
-        } catch (Exception ignored) {}
-        return -1;
+        }
+        return total / (1024L * 1024L);
     }
 }

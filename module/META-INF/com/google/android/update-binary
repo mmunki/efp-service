@@ -1,0 +1,14 @@
+#!/sbin/sh
+# Magisk module installer for the FactoryPop eFootball protection module.
+# The module itself is installed by Magisk's util_functions.sh.
+
+umask 022
+OUTFD=$2
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+. /data/adb/magisk/util_functions.sh
+
+install_module
+exit 0

@@ -12,6 +12,8 @@ import com.factorypop.efp.FpUninstallGuard;
 public class BlockUninstall {
 
     public static void main(String[] args) {
+        com.factorypop.efp.Platform.exemptHiddenApis();
+
         String pkg = (args != null && args.length > 0) ? args[0] : null;
         if (pkg == null || pkg.trim().isEmpty()) {
             String e = System.getenv("FACTORYPOP_PKG");
