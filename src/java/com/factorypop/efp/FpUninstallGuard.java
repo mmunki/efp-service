@@ -1,8 +1,6 @@
 package com.factorypop.efp;
 
 import android.content.Context;
-import android.content.pm.ApplicationInfo;
-import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.app.ActivityManager;
 import android.os.StatFs;
@@ -83,16 +81,20 @@ public class FpUninstallGuard {
     public static Context currentContext() { return appContext; }
     public static void attachContext(Context c) { appContext = c; }
 
-    /** try to obtain a usable (system) context when none was attached */
+    /**
+     * A usable context when none was attached.
+     *
+     * In an app_process the guard has no Android application context at all;
+     * that is fine, {@link Platform} talks to the system services directly.
+     * Only an already existing ActivityThread is reused, the guard never
+     * attaches itself to the system as a fake system process.
+     */
     public static Context acquireContext() {
         if (appContext != null) { return appContext; }
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
             Object thread = null;
-            try { thread = at.getMethod("systemMain").invoke(null); } catch (Exception ignored) {}
-            if (thread == null) {
-                try { thread = at.getMethod("currentActivityThread").invoke(null); } catch (Exception ignored) {}
-            }
+            try { thread = at.getMethod("currentActivityThread").invoke(null); } catch (Exception ignored) {}
             if (thread != null) {
                 for (String m : new String[] { "getSystemContext", "getApplication" }) {
                     try {
@@ -129,9 +131,8 @@ public class FpUninstallGuard {
     }
 
     public boolean isInstalled() {
-        PackageManager p = pm();
-        if (p == null) { return false; }
-        try { p.getPackageInfo(pkg, 0); return true; } catch (Exception e) { return false; }
+        // IPackageManager first, the same service pm queries - no /system/bin/pm
+        return Platform.packageInstalled(pkg, 0);
     }
 
     /** /data/data/<pkg> */
@@ -297,6 +298,10 @@ public class FpUninstallGuard {
      * package.
      */
     public boolean setUninstallBlocked(boolean block) {
+        // PackageManagerService.setBlockUninstallForUser over IPackageManager:
+        // the call that used to need `cmd package` in /system/bin.
+        if (Platform.setBlockUninstall(pkg, block, 0)) { return true; }
+
         PackageManager p = pm();
         if (p == null) { return false; }
         try {
@@ -351,30 +356,12 @@ public class FpUninstallGuard {
     }
 
     public String installStamp() {
-        PackageManager p = pm();
-        if (p == null) { return null; }
-        try {
-            PackageInfo pi = p.getPackageInfo(pkg, 0);
-            return String.valueOf(pi.firstInstallTime);
-        } catch (Exception e) {
-            return null;
-        }
+        long t = Platform.firstInstallTime(pkg, 0);
+        return t > 0 ? String.valueOf(t) : null;
     }
 
     public int appUid() {
-        PackageManager p = pm();
-        if (p == null) { return -1; }
-        try {
-            ApplicationInfo ai = p.getApplicationInfo(pkg, 0);
-            return ai.uid;
-        } catch (Exception e) {
-            // fallback stat
-            try {
-                File d = dataDir();
-                // no stat uid easily; return -1
-            } catch (Exception ignored) {}
-            return -1;
-        }
+        return Platform.appUid(pkg, 0);
     }
 
     public boolean appRunning() {
@@ -400,15 +387,8 @@ public class FpUninstallGuard {
                 }
             } catch (Exception ignored) {}
         }
-        // fallback pidof
-        try {
-            Process p = new ProcessBuilder("pidof", pkg).start();
-            BufferedReader br = new BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
-            String line = br.readLine();
-            p.waitFor();
-            return line != null && !line.trim().isEmpty();
-        } catch (Exception ignored) {}
-        return false;
+        // /proc scan, no pidof binary needed
+        return Platform.pidOf(pkg) > 0;
     }
 
     public boolean sentinelMissing() { return !sentinelFile().exists(); }
@@ -430,6 +410,10 @@ public class FpUninstallGuard {
 
     // ---- helpers ----
     private void forceStopApp(String p) {
+        // IActivityManager.forceStopPackage is what `am force-stop` calls - and
+        // `am` is only a shell wrapper around /system/bin/cmd.  Talk to the
+        // service directly so the wipe restore needs no command in bin/.
+        if (Platform.forceStop(p, 0)) { return; }
         Context c = ctx;
         if (c == null) { c = acquireContext(); }
         if (c != null) {
@@ -438,7 +422,6 @@ public class FpUninstallGuard {
                 if (am != null) { am.killBackgroundProcesses(p); }
             } catch (Exception ignored) {}
         }
-        exec("am", "force-stop", p);
     }
 
     public static int exec(String... cmd) {
@@ -455,17 +438,17 @@ public class FpUninstallGuard {
     }
 
     public static boolean commandExists(String name) {
-        try {
-            Process p = new ProcessBuilder("sh", "-c", "command -v " + name).start();
-            java.io.InputStream is = p.getInputStream();
-            byte[] buf = new byte[256];
-            int n = is.read(buf);
-            is.close();
-            p.waitFor();
-            return n > 0;
-        } catch (Exception e) {
-            return false;
+        // look at the standard bin directories instead of running a shell
+        String[] dirs = {
+                "/system/bin", "/system/xbin", "/system_ext/bin", "/vendor/bin",
+                "/product/bin", "/odm/bin", "/apex/com.android.runtime/bin",
+                "/apex/com.android.toybox/bin", "/data/adb/ksu/bin", "/data/adb/magisk"
+        };
+        for (String d : dirs) {
+            File f = new File(d, name);
+            if (f.isFile()) { return true; }
         }
+        return false;
     }
 
     private static String timestamp() {
@@ -536,17 +519,26 @@ public class FpUninstallGuard {
     }
 
     private long dirSizeMb(File d) {
-        try {
-            Process p = new ProcessBuilder("du", "-sm", d.getAbsolutePath()).start();
-            BufferedReader br = new BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
-            String line = br.readLine();
-            p.waitFor();
-            br.close();
-            if (line != null) {
-                String[] parts = line.trim().split("\\s+");
-                if (parts.length > 0) { return Long.parseLong(parts[0]); }
+        // walk the tree in Java; `du` is not needed (and nothing in bin/ is)
+        if (d == null || !d.isDirectory()) { return -1; }
+        long total = 0;
+        java.util.ArrayDeque<File> stack = new java.util.ArrayDeque<File>();
+        stack.push(d);
+        int guard = 0;
+        while (!stack.isEmpty() && guard++ < 200000) {
+            File f = stack.pop();
+            File[] kids = f.listFiles();
+            if (kids == null) { continue; }
+            for (File k : kids) {
+                try {
+                    if (k.isDirectory()) {
+                        stack.push(k);
+                    } else {
+                        total += k.length();
+                    }
+                } catch (Throwable ignored) {}
             }
-        } catch (Exception ignored) {}
-        return -1;
+        }
+        return total / (1024L * 1024L);
     }
 }

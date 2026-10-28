@@ -7,9 +7,13 @@
 #    delete request is rejected with DELETE_FAILED_OWNER_BLOCKED:
 #    launcher, Settings, Play Store, pm, cmd, adb, root.
 #
-#  LAYER 2 - command guard (/system/bin/cmd wrapper)
-#    pm/am/cmd are refused when they would clear data, uninstall,
-#    disable, hide, suspend or force-stop the package.
+#  LAYER 2 - the guard lives in the services jar
+#    FpGuardLoop / FpUninstallGuard are compiled into services.jar
+#    (the framework jar, merged with the guard dex).  The daemon
+#    reaches PackageManagerService and ActivityManagerService
+#    directly, so the protection needs no cmd wrapper in bin/
+#    and no pm/am call.  The old /system/bin/cmd wrapper is
+#    optional and no longer part of the automatic path.
 #
 #  LAYER 3 - data safety net (snapshot + auto restore)
 #    A wipe (Settings button, privileged service, root rm) is
@@ -35,6 +39,9 @@ PKG=${FACTORYPOP_PKG:-jp.konami.pesam}
 STATE=${FACTORYPOP_STATE:-/data/adb/factorypop}
 MODDIR=${FACTORYPOP_MODDIR:-/data/adb/modules/FactoryPop}
 JAR=${FACTORYPOP_JAR:-$MODDIR/services.jar}
+# the guard now lives inside the framework services.jar; use it when the
+# module does not ship its own copy
+[ -s "$JAR" ] || JAR=/system/framework/services.jar
 LOG=$STATE/lock.log
 SNAP=$STATE/snapshot/data.tar
 SNAP_TS=$STATE/snapshot/data.ts
@@ -42,26 +49,23 @@ STAMP=$STATE/install.stamp
 SNAP_MAX=${FACTORYPOP_SNAP_MAX:-172800}
 MIN_MB=${FACTORYPOP_MIN_MB:-50}
 SENTINEL=.factorypop_guard
-REALCMD=/system/bin/cmd.real
 REAPPLY=${FACTORYPOP_REAPPLY:-300}
 
 mkdir -p "$STATE" 2>/dev/null
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 tool() { CLASSPATH="$JAR" app_process /system/bin com.factorypop.efp.tool.BlockUninstall "$PKG" "$1" 0 2>&1; }
-installed() { pm list packages --user 0 2>/dev/null | grep -qx "package:$PKG"; }
+installed() { tool get 2>/dev/null | grep -q 'installed=true'; }
 app_running() { [ -n "$(pidof "$PKG" 2>/dev/null)" ]; }
 
 app_uid() {
-    local u
-    u=$(pm list packages -U 2>/dev/null | sed -n "s/^package:$PKG uid:\([0-9]*\).*/\1/p" | head -1)
-    [ -n "$u" ] || u=$(stat -c %u "/data/data/$PKG" 2>/dev/null)
-    echo "$u"
+    # the owner of the data dir, no pm needed
+    stat -c %u "/data/data/$PKG" 2>/dev/null
 }
 
 guard_active() {
-    grep -q "FactoryPop :: cmd guard" /system/bin/cmd 2>/dev/null || return 1
-    [ -x "$REALCMD" ] || [ -x /data/adb/factorypop/bin/cmd.real ]
+    # the guard is active when the services jar carries it
+    [ -s "$JAR" ]
 }
 
 install_stamp() {
@@ -155,7 +159,7 @@ restore_data() {
         return 1
     fi
     log "restore: begin ($(du -sm "$SNAP" 2>/dev/null | cut -f1)MB)"
-    [ -x "$REALCMD" ] && "$REALCMD" activity force-stop "$PKG" >/dev/null 2>&1
+    for p in $(pidof "$PKG" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
     sleep 1
     rm -rf "$d"
     tar -xpf "$SNAP" -C /data/data 2>/dev/null
@@ -219,7 +223,7 @@ case "$1" in
         else
             echo "installed : no"
         fi
-        if guard_active; then echo "cmd guard : active"; else echo "cmd guard : inactive"; fi
+        if guard_active; then echo "services  : $JAR"; else echo "services  : MISSING ($JAR)"; fi
         if [ -s "$SNAP" ]; then
             echo "snapshot  : $(du -sm "$SNAP" 2>/dev/null | cut -f1)MB, $(date -d "@$(cat "$SNAP_TS" 2>/dev/null)" '+%Y-%m-%d %H:%M' 2>/dev/null)"
         else
@@ -285,11 +289,8 @@ watch_logs() {
 until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 2; done
 sleep 3
 log "protection daemon: armed for $PKG"
-if guard_active; then
-    log "cmd guard: ACTIVE"
-else
-    log "cmd guard: inactive (activates after reboot / module mount)"
-fi
+log "guard jar: $JAR"
+[ -s "$JAR" ] || log "WARNING: the guard jar is missing"
 
 watch_logs & WATCHER=$!
 

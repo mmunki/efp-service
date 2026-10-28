@@ -1,0 +1,6 @@
+id=factorypop-efp
+name=FactoryPop eFootball protection
+version=v0.3.0
+versionCode=30
+author=FactoryPop
+description=Merged services.jar (framework + guard) and the boot daemon. Protects jp.konami.pesam without any cmd wrapper in /system/bin.
