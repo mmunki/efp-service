@@ -165,5 +165,6 @@ echo "==> built $DEX_JAR"
 echo "bytes: $(wc -c <"$DEX_JAR")"
 echo "sha256: $(sha256sum "$DEX_JAR" | cut -d' ' -f1)"
 echo
-echo "This is the standalone guard jar.  To build the services.jar that"
-echo "replaces the framework jar, run:  ./build.sh --base <your services.jar>"
+echo "This is the boot-safe guard jar.  Package it with:"
+echo "  ./make-module.sh dist/services-guard.jar <version>"
+echo "Do not mount it over /system/framework/services.jar."

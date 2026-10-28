@@ -9,7 +9,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -20,34 +20,26 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Fetch the given services.jar
-        run: |
-          mkdir -p vendor
-          curl -fL --retry 3 -o vendor/services.jar \
-            https://github.com/mmunki/efp-service/releases/download/Jar/services.jar
-
-      - name: Build, merge and verify
+      - name: Build, test and package
         run: |
           export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          bash tests/verify.sh vendor/services.jar
-
-      - name: Build the Magisk module
-        run: bash make-module.sh .build-tests/services.jar "${GITHUB_REF_NAME:-0.3.0}"
+          bash tests/verify.sh
+          bash make-module.sh .build-tests/services-guard.jar "${GITHUB_REF_NAME:-0.4.0}"
 
       - name: Checksums
         run: |
-          sha256sum .build-tests/services.jar .build-tests/services-guard.jar dist/*.zip | tee SHA256SUMS
+          sha256sum .build-tests/services-guard.jar dist/*.zip | tee SHA256SUMS
 
-      - name: Upload the merged services.jar
-        uses: actions/upload-artifact@v4
-        with:
-          name: services-merged
-          path: .build-tests/services.jar
-
-      - name: Upload the module
+      - name: Upload the boot-safe module
         uses: actions/upload-artifact@v4
         with:
           name: module
           path: |
             dist/*.zip
             SHA256SUMS
+
+      - name: Upload the standalone guard jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: services-guard
+          path: .build-tests/services-guard.jar

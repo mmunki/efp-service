@@ -1,43 +1,18 @@
 # efp-service
 
-FactoryPop :: eFootball (JP Konami `jp.konami.pesam`) protection, packaged as a
-**merged services.jar**.
+FactoryPop :: eFootball (JP Konami `jp.konami.pesam`) protection.
 
-The daemon that used to live as the shell script `fp-test-guard.sh` is now Java
-code inside the services jar.  The jar in this project is the *given* framework
-`services.jar` with the guard dex appended - not a new, small jar that replaces
-it:
+This release is **boot-safe**.  It ships the guard as an ordinary jar in the
+Magisk module directory and loads it with `app_process` on top of the stock
+framework.  It does **not** mount anything over
+`/system/framework/services.jar`.
 
-```
-classes.dex      } unchanged framework dex files
-classes2.dex     }
-classes3.dex     }
-classes4.dex     }
-classes5.dex     <-- the guard (FpUninstallGuard, FpGuardLoop,
-                     FpUninstallGuardService, BlockUninstall, GuardDaemon)
-META-INF, ...    unchanged framework resources
-```
-
-Every original entry of the given jar is preserved byte for byte (same CRC-32,
-same size, same compression method); the guard is one additional dex file that
-ART loads together with the others.
-
-## Why the merge
-
-A framework `services.jar` contains the whole `com.android.server` framework.  A
-jar with only the guard classes cannot replace it - the system would lose its
-framework.  At the same time the old setup needed a `cmd` wrapper in
-`/system/bin` (plus `pm`/`am`, which are only shell wrappers around `cmd`) to
-apply the lock.  The merge removes both problems:
-
-* the protections still run from `services.jar`, the system file keeps working,
-* the guard reaches the platform through `IPackageManager` and
-  `IActivityManager` - the same binder interfaces `cmd`/`pm`/`am` use - so no
-  command in `/system/bin` is needed.
-
-`Platform.java` is that layer: `setBlockUninstallForUser` through
-`IPackageManager`, `forceStopPackage` through `IActivityManager`, package state
-through the platform, process state from `/proc`.
+That last point is the fix for the bootloop on the Redmi Note 14 4G: the old
+0.3.0 module replaced the ROM's framework `services.jar` with a jar built from
+a different/merged copy.  `services.jar` is a boot class path file of the ROM,
+so a mismatch there makes `system_server` fail and the device stays on the boot
+animation.  The stock file is never modified on disk; removing the module
+restores boot immediately.
 
 ## What is inside
 
@@ -50,79 +25,91 @@ src/
   java/com/factorypop/efp/FpUninstallGuardService.java  service host
   java/com/factorypop/efp/tool/BlockUninstall.java   manual lock/unlock tool
   java/com/factorypop/efp/tool/GuardDaemon.java      boot entry point
-build.sh             compile + (with --base) merge
-merge-services.sh    merge the guard into a given services.jar
-make-module.sh       package the merged jar as a Magisk module
-tests/verify.sh      build + merge + verify (fails on any regression)
+build.sh             compile the guard jar (standalone by default)
+make-module.sh       package the guard jar as a boot-safe Magisk module
+tests/verify.sh      build + module layout checks (fails on any regression)
 module/              module.prop, service.sh, installer stub
+merge-services.sh    expert path only: merge the guard into a framework jar
 fp-test-guard.sh     manual operations (status/unlock/lock/snapshot/restore)
 cmd, cmd.real        the old cmd wrapper, kept for reference - not needed
 ```
 
+## How the protection works
+
+The guard runs as root through `app_process` and reaches the platform through
+the same binder interfaces `cmd` / `pm` / `am` use:
+
+* uninstall lock: `IPackageManager.setBlockUninstallForUser`
+* force-stop: `IActivityManager.forceStopPackage`
+* package state / first install time / uid: `IPackageManager`
+* process state: `/proc`
+* data snapshot / restore: toybox `tar`, `chown`, `restorecon`
+
+No command in `/system/bin` is installed or called on the protection path.
+There is no `cmd` wrapper, no `pm`, no `am`.
+
 ## Build
 
 ```bash
-# merged services.jar (the deliverable)
-./build.sh --base services.jar --out dist/services.jar
-
-# standalone guard jar, useful for tests
+# the guard jar (small, only the guard classes)
 ./build.sh --standalone --out dist/services-guard.jar
 
-# build + merge + verify, exits non-zero on any failure
-tests/verify.sh services.jar
+# build + module layout checks
+tests/verify.sh
 
-# Magisk module around the merged jar
-./make-module.sh dist/services.jar 0.3.0
+# Magisk module around the guard jar
+./make-module.sh dist/services-guard.jar 0.4.0
 ```
 
-`./build.sh --base ...` needs `ANDROID_SDK_ROOT` with the platform `android.jar`
-and `build-tools` (`d8`, `dexdump`).  The toolkit
+`./build.sh` needs `ANDROID_SDK_ROOT` with the platform `android.jar` and
+`build-tools` (`d8`, `dexdump`).  The toolkit
 [`mmunki/android-sdk-mini`](https://github.com/mmunki/android-sdk-mini) works,
 the standard Android SDK does too.
 
 ## Install
 
-### Magisk module (recommended)
+`make-module.sh` produces `dist/FactoryPop-<version>.zip` with this layout:
 
-`make-module.sh` produces `dist/FactoryPop-<version>.zip`:
-
-* `system/framework/services.jar` - the merged jar, mounted by Magisk over the
-  framework jar,
-* `service.sh` - starts the guard from that jar at boot:
-
-  ```sh
-  CLASSPATH=/system/framework/services.jar app_process /system/bin \
-      --nice-name=factorypop com.factorypop.efp.tool.GuardDaemon
-  ```
-
-No `cmd` wrapper, no `pm`, no `am` on the protection path.
-
-### Manual
-
-```bash
-# one protection cycle, useful to check the setup
-CLASSPATH=/system/framework/services.jar app_process /system/bin \
-    com.factorypop.efp.tool.GuardDaemon --status
-
-# run it (root)
-CLASSPATH=/system/framework/services.jar app_process /system/bin \
-    --nice-name=factorypop com.factorypop.efp.tool.GuardDaemon &
+```
+module.prop
+service.sh
+services.jar                     <- the guard jar, in the module directory
+META-INF/com/google/android/...  <- Magisk installer
 ```
 
-`GuardDaemon` waits for `sys.boot_completed`, takes a pid lock in
-`/data/adb/factorypop/lock.lock`, runs the same loop as the old shell daemon and
-keeps a log in `/data/adb/factorypop/lock.log`.
+There is deliberately no `system/` tree.  `service.sh` starts:
 
-> **Note on replacing the framework jar.** Mounting a modified
-> `/system/framework/services.jar` changes a boot class path file, so ART sees
-> a checksum mismatch for the pre-optimised code and falls back to the dex on
-> first boot (a slower first boot).  If a device refuses it, disable the module
-> from recovery (or with the volume keys during boot) - the stock
-> `services.jar` is not modified on disk.
->
-> The protection itself does **not** require the framework file to be
-> replaced: the same merged jar can live in the module directory and be used as
-> `CLASSPATH` only.
+```sh
+CLASSPATH=$MODDIR/services.jar app_process /system/bin \
+    --nice-name=factorypop com.factorypop.efp.tool.GuardDaemon --pkg jp.konami.pesam
+```
+
+## If the device is already stuck on the boot animation
+
+The previous 0.3.0 module mounted a modified framework jar.  Nothing was
+written to the stock partition, so disabling/removing the module is enough:
+
+1. **Magisk safe mode**: hold **Volume Down** while the device boots (start
+   holding as soon as the boot logo appears, keep holding until the lock
+   screen / home screen).  Magisk disables all modules for that boot.
+2. Once Android is up, delete the module directory (root shell):
+
+   ```sh
+   su -c 'rm -rf /data/adb/modules/factorypop-efp'
+   ```
+
+   or disable it for the next boot:
+
+   ```sh
+   su -c 'touch /data/adb/modules/factorypop-efp/disable'
+   ```
+
+3. Reboot and confirm the phone starts normally.
+4. Flash the 0.4.0 module.  It only adds `services.jar` inside its own module
+   directory and cannot affect `system_server`.
+
+If recovery (TWRP / OrangeFox / Magisk recovery) is available, the same two
+commands work through its terminal or `adb shell` while `/data` is mounted.
 
 ## Manual operations
 
@@ -135,21 +122,32 @@ sh fp-test-guard.sh --restore
 sh fp-test-guard.sh --restore-old
 ```
 
-The script now uses the guard in the services jar (`$MODDIR/services.jar`, or
-`/system/framework/services.jar`), and its status/lock calls go through
+The script uses `$MODDIR/services.jar` (the guard jar in the module directory),
+and its status/lock calls go through
 `com.factorypop.efp.tool.BlockUninstall` - no `pm`, no `am`, no `cmd`.
+
+## Expert path: merged framework jar
+
+`merge-services.sh` and `build.sh --base` still exist for people who explicitly
+want the guard inside a framework jar.  `make-module.sh` refuses such a jar and
+will not package it, because replacing `/system/framework/services.jar` is what
+caused the bootloop.  If you use that path, you own the ROM matching problem:
+the base jar must come from the exact ROM/build on the device, and the
+pre-optimised `services.odex` / `services.vdex` can still reject the change.
 
 ## Verified
 
-`tests/verify.sh` checks, against the given services.jar:
+`tests/verify.sh` checks:
 
 1. the guard jar builds with `aapt2` + `javac` + `d8` against API 36,
 2. all six guard classes are in the dex and the dex checksum is valid,
 3. the guard dex contains no `cmd`, `pm` or `am` invocation,
-4. the merge preserves all 194 original entries (CRC-32, size, compression),
-5. `classes.dex`..`classes4.dex` keep their exact SHA-256,
-6. `classes5.dex` is valid, stored uncompressed, and contains `GuardDaemon`,
-7. the merged archive is a healthy zip with contiguous dex slots.
+4. the guard jar has exactly one dex and is the jar packaged in the module,
+5. the module has **no `system/` tree** and therefore never replaces
+   `/system/framework/services.jar`,
+6. `service.sh` starts `GuardDaemon` from the module jar with `app_process`,
+7. `make-module.sh` refuses a multi-dex framework/merged jar.
 
-The dex format is architecture independent, so there is no ABI matrix to run
-for Java code; the merge and the dex checks run in CI on every push.
+The dex format is architecture independent, so there is no ABI matrix for pure
+Java code.  The device-side boot itself cannot be run in CI; the boot-safety
+comes from not touching any boot class path file at all.

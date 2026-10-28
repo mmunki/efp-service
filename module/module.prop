@@ -1,6 +1,6 @@
 id=factorypop-efp
 name=FactoryPop eFootball protection
-version=v0.3.0
-versionCode=30
+version=v0.4.0
+versionCode=40
 author=FactoryPop
-description=Merged services.jar (framework + guard) and the boot daemon. Protects jp.konami.pesam without any cmd wrapper in /system/bin.
+description=Self-contained guard jar in the module directory. Protects jp.konami.pesam without cmd/pm/am and does NOT replace /system/framework/services.jar.
