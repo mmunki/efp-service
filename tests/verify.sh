@@ -14,7 +14,7 @@ set -euo pipefail
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$PROJECT/.build-tests"
 BASE="${1:-${FACTORYPOP_BASE_JAR:-}}"
-TEST_VERSION="0.4.0-test"
+TEST_VERSION="0.5.0-test"
 MODULE="$PROJECT/dist/FactoryPop-$TEST_VERSION.zip"
 
 pass() { printf '  PASS  %s\n' "$*"; }
@@ -48,6 +48,8 @@ for cls in \
     Lcom/factorypop/efp/FpUninstallGuard\; \
     Lcom/factorypop/efp/FpGuardLoop\; \
     Lcom/factorypop/efp/FpUninstallGuardService\; \
+    Lcom/factorypop/efp/FpForensics\; \
+    Lcom/factorypop/efp/Forensic\; \
     Lcom/factorypop/efp/Platform\; \
     Lcom/factorypop/efp/tool/BlockUninstall\; \
     Lcom/factorypop/efp/tool/GuardDaemon\;
@@ -59,12 +61,35 @@ pass "all guard classes are in the guard dex"
 "$DEXDUMP" -c "$OUT/guard.dex" >/dev/null 2>&1 || fail "guard dex checksum"
 pass "guard dex checksum is valid"
 
+# The forensic log is the deliverable of this layer: its directory and file
+# name must be part of the built dex, not just the sources.
+strings "$OUT/guard.dex" | grep -qx '/data/adb/jp.konami.pes' \
+  || fail "the forensic directory /data/adb/jp.konami.pes is missing from the dex"
+strings "$OUT/guard.dex" | grep -qx 'uninstall.log' \
+  || fail "uninstall.log is missing from the dex"
+pass "the dex carries /data/adb/jp.konami.pes/uninstall.log"
+
 # The whole point of the change: nothing on the protection path may need
 # /system/bin/cmd (pm and am are wrappers around it).
 if unzip -p "$OUT/services-guard.jar" classes.dex | strings | grep -xE 'cmd|pm|am|/system/bin/cmd'; then
   fail "the guard still references cmd/pm/am"
 fi
 pass "the guard does not invoke cmd, pm or am"
+
+# ---------------------------------------------------------------------------
+step "run the host tests for the forensic parser"
+bash "$PROJECT/tests/forensic-test.sh" >"$OUT/forensic-test.log" 2>&1 \
+  || { cat "$OUT/forensic-test.log" >&2; fail "tests/forensic-test.sh"; }
+grep -q '0 failed' "$OUT/forensic-test.log" \
+  || { cat "$OUT/forensic-test.log" >&2; fail "forensic parser tests"; }
+pass "forensic parser + manifest diff tests"
+
+step "run the host test for the forensic log writer"
+bash "$PROJECT/tests/forensic-runtime-test.sh" >"$OUT/forensic-runtime-test.log" 2>&1 \
+  || { cat "$OUT/forensic-runtime-test.log" >&2; fail "tests/forensic-runtime-test.sh"; }
+grep -q '0 failed' "$OUT/forensic-runtime-test.log" \
+  || { cat "$OUT/forensic-runtime-test.log" >&2; fail "forensic log writer tests"; }
+pass "forensic log writer + report sections + file path"
 
 # ---------------------------------------------------------------------------
 step "package the boot-safe Magisk module"
@@ -112,6 +137,18 @@ unzip -p "$MODULE" service.sh | grep -q 'com.factorypop.efp.tool.GuardDaemon' \
 unzip -p "$MODULE" service.sh | grep -q 'app_process /system/bin' \
   || fail "service.sh does not use app_process"
 pass "service.sh starts GuardDaemon from the module jar, not from /system"
+
+# The forensic log must exist in both entry points: the boot script creates it
+# and the manual script mirrors its lock log into it.
+grep -q '/data/adb/jp.konami.pes' "$PROJECT/fp-test-guard.sh" \
+  || fail "fp-test-guard.sh does not use /data/adb/jp.konami.pes"
+grep -q 'uninstall.log' "$PROJECT/fp-test-guard.sh" \
+  || fail "fp-test-guard.sh does not write uninstall.log"
+unzip -p "$MODULE" service.sh | grep -q '/data/adb/jp.konami.pes' \
+  || fail "module service.sh does not create the forensic directory"
+unzip -p "$MODULE" service.sh | grep -q 'uninstall.log' \
+  || fail "module service.sh does not write uninstall.log"
+pass "both scripts use /data/adb/jp.konami.pes/uninstall.log"
 
 # ---------------------------------------------------------------------------
 step "refuse a framework/merged jar as a module payload"

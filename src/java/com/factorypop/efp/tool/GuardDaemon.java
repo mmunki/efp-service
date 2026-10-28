@@ -81,6 +81,7 @@ public class GuardDaemon {
         }
 
         if (once) {
+            guard.forensics().sessionStart();
             new FpGuardLoop(guard).tick();
             return;
         }
@@ -130,6 +131,7 @@ public class GuardDaemon {
                     + (guard.oldSnapshotFile().length() / (1024 * 1024)) + "MB (--restore-old)");
         }
         System.out.println("log       : " + guard.logFile());
+        System.out.println("forensic  : " + guard.uninstallLogFile());
     }
 
     private static void waitForBoot() {

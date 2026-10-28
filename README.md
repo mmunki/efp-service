@@ -22,12 +22,16 @@ src/
   java/com/factorypop/efp/Platform.java              platform access (no cmd)
   java/com/factorypop/efp/FpUninstallGuard.java      state machine
   java/com/factorypop/efp/FpGuardLoop.java           the fp-test-guard daemon
+  java/com/factorypop/efp/FpForensics.java           uninstall.log writer + /proc scan
+  java/com/factorypop/efp/Forensic.java              pure Java parser + manifest diff
   java/com/factorypop/efp/FpUninstallGuardService.java  service host
   java/com/factorypop/efp/tool/BlockUninstall.java   manual lock/unlock tool
   java/com/factorypop/efp/tool/GuardDaemon.java      boot entry point
 build.sh             compile the guard jar (standalone by default)
 make-module.sh       package the guard jar as a boot-safe Magisk module
 tests/verify.sh      build + module layout checks (fails on any regression)
+tests/forensic-test.sh  host tests for the parser and manifest diff
+tests/forensic-runtime-test.sh  host test for the log writer and report
 module/              module.prop, service.sh, installer stub
 merge-services.sh    expert path only: merge the guard into a framework jar
 fp-test-guard.sh     manual operations (status/unlock/lock/snapshot/restore)
@@ -47,6 +51,60 @@ the same binder interfaces `cmd` / `pm` / `am` use:
 
 No command in `/system/bin` is installed or called on the protection path.
 There is no `cmd` wrapper, no `pm`, no `am`.
+
+## The forensic log: backup + who deleted it
+
+Starting with 0.5.0 the guard keeps a forensic log at:
+
+```
+/data/adb/jp.konami.pes/uninstall.log
+```
+
+It is written even when `lock.log` has already scrolled away and it contains
+both halves of the request:
+
+**The backup process**
+
+* `BACKUP START` - trigger, data path, free space.
+* `BACKUP DONE` - bytes, size in MB, SHA-256, duration.
+* `BACKUP SKIPPED` / `BACKUP FAILED` - the exact reason.
+* `MANIFEST` - the file list saved next to the snapshot
+  (`/data/adb/factorypop/snapshot/manifest.tsv`), which is what makes a
+  precise diff possible.
+
+**The deletion process**
+
+Every tick compares the data directory with the last manifest.  When the
+sentinel disappears, the package is removed, or persistent files are deleted
+while the game is stopped, the guard writes a `DELETION EVENT` block:
+
+* the trigger and the exact files that disappeared (path + size + mtime);
+* the logcat **buffer** and **exact line** that reported the attempt, for the
+  `events`, `main`, `system`, `crash` and `kernel` buffers;
+* every recorded caller line with uid, pid and user (`Uninstall pkg ... from
+  uid:`, `clearApplicationUserData ... callingUid=`, `am_force_stop: [user,pid]`,
+  `Killing pid:pkg/u0aNN`);
+* a `/proc` scan: pid, uid, ppid, comm, exe, cwd, cmdline and every file
+  descriptor that points below `/data/data/jp.konami.pesam`.  A descriptor
+  marked `(deleted)` is direct evidence of the process that deleted the data;
+* the likely culprit and the package that owns its uid;
+* a **HOW TO STOP IT** section tailored to the caller: root app/module,
+  adb/root shell, a specific app uid, or an unknown process with open deleted
+  files, plus where the backup is and how the lock comes back;
+* `RESTORE START` / `RESTORE DONE` when the snapshot is put back.
+
+The log is mode 0600 in a 0700 directory and rotates to `uninstall.log.1` at
+8 MB.  View it from a root shell:
+
+```bash
+sh fp-test-guard.sh --uninstall-log
+```
+
+or open `/data/adb/jp.konami.pes/uninstall.log` directly.  `--status` now
+prints the path too.
+
+The write path is best effort on purpose: if `/data/adb` is not writable the
+protection keeps running and only the forensic entry is lost.
 
 ## Build
 
@@ -120,6 +178,7 @@ sh fp-test-guard.sh --lock
 sh fp-test-guard.sh --snapshot
 sh fp-test-guard.sh --restore
 sh fp-test-guard.sh --restore-old
+sh fp-test-guard.sh --uninstall-log
 ```
 
 The script uses `$MODDIR/services.jar` (the guard jar in the module directory),
@@ -140,13 +199,19 @@ pre-optimised `services.odex` / `services.vdex` can still reject the change.
 `tests/verify.sh` checks:
 
 1. the guard jar builds with `aapt2` + `javac` + `d8` against API 36,
-2. all six guard classes are in the dex and the dex checksum is valid,
+2. all eight guard classes are in the dex and the dex checksum is valid,
 3. the guard dex contains no `cmd`, `pm` or `am` invocation,
-4. the guard jar has exactly one dex and is the jar packaged in the module,
-5. the module has **no `system/` tree** and therefore never replaces
+4. the guard dex carries `/data/adb/jp.konami.pes` and `uninstall.log`,
+5. the pure-Java forensic parser and manifest diff pass their host tests
+   (`tests/forensic-test.sh`: uninstall/clear/force-stop event parsing, uid/pid
+   extraction, manifest diff, advice generation),
+6. the real forensic writer runs on the host (`tests/forensic-runtime-test.sh`:
+   report sections, caller uid, removed file list, `/proc` and log file path),
+7. the guard jar has exactly one dex and is the jar packaged in the module,
+8. the module has **no `system/` tree** and therefore never replaces
    `/system/framework/services.jar`,
-6. `service.sh` starts `GuardDaemon` from the module jar with `app_process`,
-7. `make-module.sh` refuses a multi-dex framework/merged jar.
+9. `service.sh` starts `GuardDaemon` from the module jar with `app_process`,
+10. `make-module.sh` refuses a multi-dex framework/merged jar.
 
 The dex format is architecture independent, so there is no ABI matrix for pure
 Java code.  The device-side boot itself cannot be run in CI; the boot-safety

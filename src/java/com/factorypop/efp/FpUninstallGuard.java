@@ -35,10 +35,14 @@ public class FpUninstallGuard {
     public final File stateDir;
     public final File modDir;
     public final File jarFile;
+    public final File forensicDir;
+    public final File dataRoot;
     public final long snapMax;
     public final long minMb;
 
+    private FpForensics forensics;
     private boolean waitLogged = false;
+    private boolean partialRestore = true;
 
     public FpUninstallGuard(Context ctx, String pkg) {
         this.ctx = ctx;
@@ -76,6 +80,54 @@ public class FpUninstallGuard {
         String mmEnv = System.getenv("FACTORYPOP_MIN_MB");
         if (mmEnv != null) { try { mm = Long.parseLong(mmEnv.trim()); } catch (NumberFormatException ignored) {} }
         this.minMb = mm;
+
+        String fd = System.getenv("FACTORYPOP_FORENSIC_DIR");
+        if (fd == null || fd.trim().isEmpty()) { fd = Forensic.DEFAULT_DIR; }
+        this.forensicDir = new File(fd.trim());
+
+        String pr = System.getenv("FACTORYPOP_PARTIAL_RESTORE");
+        if (pr != null) { this.partialRestore = !"0".equals(pr.trim()); }
+
+        String dr = System.getenv("FACTORYPOP_DATA_DIR");
+        this.dataRoot = new File((dr == null || dr.trim().isEmpty()) ? "/data/data" : dr.trim());
+    }
+
+    /** forensic log under /data/adb/jp.konami.pes/uninstall.log */
+    public FpForensics forensics() {
+        if (forensics == null) { forensics = new FpForensics(this); }
+        return forensics;
+    }
+
+    public File uninstallLogFile() { return new File(forensicDir, Forensic.LOG_NAME); }
+
+    public File manifestFile() { return new File(snapshotDir(), Forensic.MANIFEST_NAME); }
+
+    public boolean partialRestoreEnabled() { return partialRestore; }
+
+    /** Loads the manifest written together with the last snapshot, if any. */
+    public Forensic.Manifest readManifest() {
+        File f = manifestFile();
+        if (!f.isFile()) { return null; }
+        try {
+            StringBuilder sb = new StringBuilder();
+            BufferedReader br = new BufferedReader(new FileReader(f));
+            String line;
+            while ((line = br.readLine()) != null) { sb.append(line).append('\n'); }
+            br.close();
+            return Forensic.Manifest.parse(sb.toString());
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    public void writeManifest(Forensic.Manifest m) {
+        if (m == null) { return; }
+        try {
+            Forensic.writeText(manifestFile(), m.toTsv());
+            forensics().manifestSaved(manifestFile(), m.files, m.totalBytes);
+        } catch (IOException e) {
+            forensics().warn("BACKUP", "manifest write failed: " + e);
+        }
     }
 
     public static Context currentContext() { return appContext; }
@@ -136,7 +188,7 @@ public class FpUninstallGuard {
     }
 
     /** /data/data/<pkg> */
-    public File dataDir() { return new File("/data/data", pkg); }
+    public File dataDir() { return new File(dataRoot, pkg); }
 
     public File snapshotDir() { return new File(stateDir, "snapshot"); }
     public File snapshotFile() { return new File(snapshotDir(), "data.tar"); }
@@ -174,6 +226,7 @@ public class FpUninstallGuard {
             fw.write(timestamp() + " " + msg + "\n");
             fw.close();
         } catch (IOException ignored) {}
+        try { forensics().mirror(msg); } catch (Throwable ignored) {}
         System.out.println(msg);
     }
 
@@ -187,10 +240,13 @@ public class FpUninstallGuard {
         snapshotDir().mkdirs();
         File snap = snapshotFile();
         File snapTs = snapshotTsFile();
+        long started = System.currentTimeMillis();
+        String trigger = force ? "forced" : "auto";
 
         // never overwrite a good snapshot with a wiped/empty data dir
         if (snap.isFile() && snap.length() > 0 && !sentinelFile().exists()) {
             log("snapshot: skipped (data looks wiped - restore pending)");
+            forensics().backupSkipped("data looks wiped - restore pending");
             return true;
         }
         if (!force && snap.isFile() && snap.length() > 0 && snapTs.isFile()) {
@@ -201,12 +257,14 @@ public class FpUninstallGuard {
         // app running check
         if (appRunning()) {
             if (force) { log("snapshot: skipped (app is running)"); }
+            if (force) { forensics().backupSkipped("app is running"); }
             return true;
         }
         // low space
         long freeKb = freeSpaceKb("/data");
         if (freeKb > 0 && freeKb < 5242880L) {
             log("snapshot: skipped (low space)");
+            forensics().backupSkipped("low space: " + freeKb + "KB free, need 5120MB");
             return false;
         }
         // min size wait
@@ -221,6 +279,7 @@ public class FpUninstallGuard {
         waitLogged = false;
 
         log("snapshot: creating (game is idle)...");
+        forensics().backupStart(trigger, d, freeKb);
         File tmp = new File(snapshotDir(), "data.tar.tmp");
         tmp.delete();
         int rc = exec("tar", "-cf", tmp.getAbsolutePath(), "-C", "/data/data", pkg);
@@ -234,10 +293,16 @@ public class FpUninstallGuard {
             try { writeFile(snapTs, String.valueOf(now())); } catch (Exception ignored) {}
             touchSentinel();
             log("snapshot: ready (" + (snap.length() / (1024 * 1024)) + "MB)");
+            String sha = Forensic.sha256(snap);
+            forensics().backupDone(snap, snap.length(),
+                    System.currentTimeMillis() - started, sha);
+            writeManifest(Forensic.Manifest.scan(d));
             return true;
         } else {
             tmp.delete();
             log("snapshot: FAILED");
+            forensics().backupFailed("tar rc=" + rc
+                    + " tmp=" + (tmp.isFile() ? tmp.length() : 0) + "bytes");
             return false;
         }
     }
@@ -253,14 +318,19 @@ public class FpUninstallGuard {
         restoreData();
     }
 
-    public boolean restoreData() {
+    public boolean restoreData() { return restoreData("requested"); }
+
+    public boolean restoreData(String reason) {
         File snap = snapshotFile();
         needRestoreFile().delete();
         if (!snap.isFile() || snap.length() == 0) {
             log("restore: no snapshot available");
+            forensics().restoreStart(reason + " (no snapshot)", snap);
             return false;
         }
+        long started = System.currentTimeMillis();
         log("restore: begin (" + (snap.length() / (1024 * 1024)) + "MB)");
+        forensics().restoreStart(reason, snap);
         forceStopApp(pkg);
         sleep(1000);
         deleteRecursive(dataDir());
@@ -274,6 +344,8 @@ public class FpUninstallGuard {
         }
         touchSentinel();
         log("restore: done - data returned from snapshot");
+        forensics().restoreDone(rc == 0, System.currentTimeMillis() - started);
+        writeManifest(Forensic.Manifest.scan(dataDir()));
         return rc == 0;
     }
 
@@ -342,6 +414,12 @@ public class FpUninstallGuard {
             olds.delete();
             snap.renameTo(olds);
             snapshotTsFile().delete();
+            File mf = manifestFile();
+            if (mf.isFile()) {
+                File oldMf = new File(snapshotDir(), "manifest.old.tsv");
+                oldMf.delete();
+                mf.renameTo(oldMf);
+            }
             log("snapshot: previous install archived as data.old.tar");
         }
         // remove sentinel

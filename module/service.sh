@@ -23,12 +23,18 @@ MODDIR=${0%/*}
 JAR="$MODDIR/services.jar"
 STATE=/data/adb/factorypop
 LOG="$STATE/boot.log"
+FORENSIC=${FACTORYPOP_FORENSIC_DIR:-/data/adb/jp.konami.pes}
+UNLOG="$FORENSIC/uninstall.log"
 PKG=${FACTORYPOP_PKG:-jp.konami.pesam}
 
-mkdir -p "$STATE" 2>/dev/null
+mkdir -p "$STATE" "$FORENSIC" 2>/dev/null
+chmod 700 "$FORENSIC" 2>/dev/null
+[ -f "$UNLOG" ] || : > "$UNLOG" 2>/dev/null
+chmod 600 "$UNLOG" 2>/dev/null
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG" 2>/dev/null
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [SERVICE] $*" >> "$UNLOG" 2>/dev/null
 }
 
 # A jar under /system/framework is the framework jar.  It does not carry the
@@ -52,7 +58,7 @@ if [ -f "$STATE/lock.lock/pid" ]; then
     [ -n "$PID" ] && [ -d "/proc/$PID" ] && exit 0
 fi
 
-log "starting guard from $JAR (pkg $PKG)"
+log "starting guard from $JAR (pkg $PKG, forensic $UNLOG)"
 CLASSPATH="$JAR" app_process /system/bin \
     --nice-name=factorypop \
     com.factorypop.efp.tool.GuardDaemon --pkg "$PKG" --user 0 \

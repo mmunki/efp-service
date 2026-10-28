@@ -97,6 +97,28 @@ public final class Platform {
         }
     }
 
+    /**
+     * Packages owned by a uid - used by the forensic report to name the app
+     * behind a "from uid: 10123" line.  IPackageManager.getPackagesForUid is
+     * the same call the package manager shell uses; the Context fallback keeps
+     * the service path working.
+     */
+    public static String[] packagesForUid(int uid) {
+        Object pm = ipm();
+        if (pm != null) {
+            try {
+                Method m = pm.getClass().getMethod("getPackagesForUid", int.class);
+                Object r = m.invoke(pm, uid);
+                if (r instanceof String[]) { return (String[]) r; }
+            } catch (Throwable ignored) {}
+        }
+        Context c = FpUninstallGuard.acquireContext();
+        if (c != null) {
+            try { return c.getPackageManager().getPackagesForUid(uid); } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
     public static boolean packageInstalled(String pkg, int user) {
         if (packageInfo(pkg, user) != null) { return true; }
         Context c = FpUninstallGuard.acquireContext();
