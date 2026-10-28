@@ -7,25 +7,32 @@ import com.factorypop.efp.FpUninstallGuard;
  * through the Android runtime:
  *
  *   CLASSPATH=<services.jar> app_process /system/bin com.factorypop.efp.tool.BlockUninstall \
- *       <pkg> <true|false> 0
- *
- * <pkg>   protected package (default jp.konami.pesam)
- * <op>    true  -> block the uninstall
- *         false -> allow the uninstall (consumed by an unlock)
- *         get   -> report the current lock state
+ *       <pkg> <true|false|get> 0
  */
 public class BlockUninstall {
 
     public static void main(String[] args) {
-        if (args == null || args.length < 1) { return; }
-        String pkg = args[0];
-        String op = args.length > 1 ? args[1] : "get";
-        boolean lock = "true".equals(op);
+        String pkg = (args != null && args.length > 0) ? args[0] : null;
+        if (pkg == null || pkg.trim().isEmpty()) {
+            String e = System.getenv("FACTORYPOP_PKG");
+            pkg = (e != null && !e.trim().isEmpty()) ? e.trim() : FpUninstallGuard.DEFAULT_PKG;
+        }
+        String op = (args != null && args.length > 1) ? args[1] : "get";
 
-        FpUninstallGuard guard = new FpUninstallGuard(FpUninstallGuard.currentContext(), pkg);
+        FpUninstallGuard guard = new FpUninstallGuard(FpUninstallGuard.acquireContext(), pkg);
+
         boolean installed = guard.isInstalled();
-        boolean blocked = guard.setUninstallBlocked(lock);
-        String out = "installed=" + installed + " blocked=" + blocked + " pkg=" + pkg;
-        System.out.println(out);
+        boolean blocked;
+        if ("true".equals(op)) {
+            blocked = guard.setUninstallBlocked(true);
+            guard.writeLocked(true);
+        } else if ("false".equals(op)) {
+            blocked = guard.setUninstallBlocked(false);
+            guard.writeLocked(false);
+        } else {
+            blocked = guard.readLocked();
+        }
+
+        System.out.println("installed=" + installed + " blocked=" + blocked + " pkg=" + pkg);
     }
 }

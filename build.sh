@@ -19,22 +19,42 @@
 # ============================================================================
 set -euo pipefail
 
-SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/src/android-sdk-mini}"
-if [ -f "$SDK_ROOT/env.sh" ]; then
-  SDK="$SDK_ROOT"
-elif [ -d "$SDK_ROOT/sdk" ]; then
-  SDK="$SDK_ROOT/sdk"
-else
-  SDK="$SDK_ROOT/build/stage/sdk"
-fi
 SDK_API="${SDK_API:-36}"
 SDK_BUILD_TOOLS="${SDK_BUILD_TOOLS:-36.0.0}"
+
+# Locate a usable SDK root.  Try the explicit env var first, then a few common
+# locations so the build works both in the developer container and in CI.
+SDK=""
+for cand in "${ANDROID_SDK_ROOT:-}" "$HOME/src/android-sdk-mini" "/tmp/opencode/android-sdk-mini/build/stage/sdk" "/tmp/opencode/android-sdk-mini/sdk" "/usr/local/lib/android/sdk"; do
+  [ -n "$cand" ] || continue
+  for root in "$cand" "$cand/sdk" "$cand/build/stage/sdk"; do
+    [ -d "$root" ] || continue
+    if [ -f "$root/platforms/android-$SDK_API/android.jar" ] && [ -d "$root/build-tools/$SDK_BUILD_TOOLS" ]; then
+      SDK="$root"
+      break 2
+    fi
+  done
+done
+[ -n "$SDK" ] || { echo "error: no Android SDK found for API $SDK_API" >&2; exit 1; }
+
 SDK_PLATFORM_DIR="$SDK/platforms/android-$SDK_API"
 SDK_ANDROID_JAR="$SDK_PLATFORM_DIR/android.jar"
 SDK_BUILD_TOOLS_DIR="$SDK/build-tools/$SDK_BUILD_TOOLS"
 SDK_JAR_DIR="$SDK_BUILD_TOOLS_DIR/lib"
-AAPT2="$SDK/bin/aapt2"
-D8="$SDK/bin/d8"
+if [ -x "$SDK/bin/aapt2" ]; then
+  AAPT2="$SDK/bin/aapt2"
+elif [ -x "$SDK_BUILD_TOOLS_DIR/aapt2" ]; then
+  AAPT2="$SDK_BUILD_TOOLS_DIR/aapt2"
+else
+  AAPT2="$(command -v aapt2)"
+fi
+if [ -x "$SDK/bin/d8" ]; then
+  D8="$SDK/bin/d8"
+elif [ -x "$SDK_BUILD_TOOLS_DIR/d8" ]; then
+  D8="$SDK_BUILD_TOOLS_DIR/d8"
+else
+  D8="$(command -v d8)"
+fi
 JAVA="${JAVA:-java}"
 
 PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,7 +69,7 @@ RES=""
 [ -f "$WORK/compiled/resources.zip" ] && RES="$WORK/compiled/resources.zip"
 
 echo "==> aapt2 link"
-bash "$AAPT2" link \
+"$AAPT2" link \
   -o "$WORK/base.apk" \
   -I "$SDK_ANDROID_JAR" \
   --manifest "$PROJECT/src/AndroidManifest.xml" \
@@ -71,7 +91,7 @@ mapfile -t CLASS_FILES < <(find "$WORK/classes" -name '*.class' -type f | sort)
 if [ ${#CLASS_FILES[@]} -eq 0 ]; then
   echo "error: javac produced no class files" >&2; exit 1
 fi
-bash "$D8" --min-api 24 --lib "$SDK_ANDROID_JAR" --output "$WORK/dex" "${CLASS_FILES[@]}"
+"$D8" --min-api 24 --lib "$SDK_ANDROID_JAR" --output "$WORK/dex" "${CLASS_FILES[@]}"
 
 mkdir -p "$(dirname "$OUT")"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
