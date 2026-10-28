@@ -34,7 +34,7 @@
 PKG=${FACTORYPOP_PKG:-jp.konami.pesam}
 STATE=${FACTORYPOP_STATE:-/data/adb/factorypop}
 MODDIR=${FACTORYPOP_MODDIR:-/data/adb/modules/FactoryPop}
-JAR=${FACTORYPOP_JAR:-$MODDIR/blockuninstall.jar}
+JAR=${FACTORYPOP_JAR:-$MODDIR/services.jar}
 LOG=$STATE/lock.log
 SNAP=$STATE/snapshot/data.tar
 SNAP_TS=$STATE/snapshot/data.ts
@@ -48,7 +48,7 @@ REAPPLY=${FACTORYPOP_REAPPLY:-300}
 mkdir -p "$STATE" 2>/dev/null
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
-tool() { CLASSPATH="$JAR" app_process /system/bin fp.tool.BlockUninstall "$PKG" "$1" 0 2>&1; }
+tool() { CLASSPATH="$JAR" app_process /system/bin com.factorypop.efp.tool.BlockUninstall "$PKG" "$1" 0 2>&1; }
 installed() { pm list packages --user 0 2>/dev/null | grep -qx "package:$PKG"; }
 app_running() { [ -n "$(pidof "$PKG" 2>/dev/null)" ]; }
 
